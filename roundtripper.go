@@ -29,6 +29,10 @@ const CHROME_MAX_FIELD_SECTION_SIZE = 262144
 // utls and the ones of the profiles in this module.
 const firefoxClientName = "Firefox"
 
+// chromeClientName is the Client of every Chrome ClientHelloID, the ones of
+// utls and the ones of the profiles in this module.
+const chromeClientName = "Chrome"
+
 var errProtocolNegotiated = errors.New("protocol negotiated")
 
 type roundTripper struct {
@@ -358,7 +362,52 @@ func profileDefaultMaxResponseHeaderBytes(cfg *http3Config) int {
 	return CHROME_MAX_FIELD_SECTION_SIZE
 }
 
+// chromiumClients are the ClientHelloID clients that send a GREASE entry in
+// the HTTP/2 SETTINGS frame. They all share Chromium's network stack, which
+// adds one RFC 8701 setting ID after the real settings, with a fresh ID and
+// value per connection. buildHTTP3Transport does the same for HTTP/3. Other
+// clients do not send a GREASE setting, so their input comes back unchanged.
+var chromiumClients = map[string]struct{}{
+	chromeClientName: {},
+	"Edge":           {},
+	"Opera":          {},
+}
+
+// chromiumHTTP2Settings adds the GREASE entry Chromium browsers send in their
+// HTTP/2 SETTINGS frame. The settings map and order come from the shared
+// profile, so copies are returned rather than writing into them.
+func chromiumHTTP2Settings(clientHelloId tls.ClientHelloID, settings map[http2.SettingID]uint32, order []http2.SettingID) (map[http2.SettingID]uint32, []http2.SettingID) {
+	if _, ok := chromiumClients[clientHelloId.Client]; !ok || len(settings) == 0 {
+		return settings, order
+	}
+
+	greaseID := generateGREASEH2SettingID()
+	for _, taken := settings[greaseID]; taken; _, taken = settings[greaseID] {
+		greaseID = generateGREASEH2SettingID()
+	}
+
+	settingsCopy := make(map[http2.SettingID]uint32, len(settings)+1)
+	for id, value := range settings {
+		settingsCopy[id] = value
+	}
+	settingsCopy[greaseID] = uint32(generateGREASESettingValue())
+
+	orderCopy := make([]http2.SettingID, len(order), len(order)+1)
+	copy(orderCopy, order)
+	orderCopy = append(orderCopy, greaseID)
+
+	return settingsCopy, orderCopy
+}
+
 func (rt *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	// A raw byte that is invalid in a URI query ends up verbatim in the HTTP/1
+	// request line and the HTTP/2 :path. url.Parse keeps it, a literal space
+	// for example then breaks the request line. Browsers never send these
+	// bytes unencoded, so fix the query up here for every protocol.
+	if req.URL != nil {
+		req.URL.RawQuery = sanitizeRawQuery(req.URL.RawQuery)
+	}
+
 	addr := rt.getDialTLSAddr(req)
 
 	if rt.racer != nil && !rt.forceHttp1 && !rt.disableHttp3 && strings.ToLower(req.URL.Scheme) == "https" {
@@ -639,6 +688,8 @@ func (rt *roundTripper) dialTLSWithSetup(ctx context.Context, network, addr stri
 			t2.Settings = rt.settings
 			t2.SettingsOrder = rt.settingsOrder
 		}
+
+		t2.Settings, t2.SettingsOrder = chromiumHTTP2Settings(rt.clientHelloId, t2.Settings, t2.SettingsOrder)
 
 		t2.Priorities = rt.priorities
 
